@@ -1,8 +1,12 @@
 # 5. Agent de Extração de Datas Flexível
 # Lida com múltiplos formatos de data:
 
-from dateutil import parser
+import re
 import locale
+from typing import List, Optional, Literal
+from pydantic import BaseModel
+from smolagents import tool
+from dateutil import parser
 
 class DateExtraction(BaseModel):
     data_original: str

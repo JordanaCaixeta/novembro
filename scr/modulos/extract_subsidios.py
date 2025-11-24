@@ -1,9 +1,14 @@
 # 4. Agent de Matching de Subsídios com Catálogo
-# Este é um dos agentes mais críticos, que compara com o catálogo de subsídios: 
+# Este é um dos agentes mais críticos, que compara com o catálogo de subsídios:
 
+import re
 import pandas as pd
+from typing import List, Optional
+from pydantic import BaseModel
+from smolagents import tool
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from scr.modulos.datas_management import extract_period_from_text
 
 class SubsidyMatch(BaseModel):
     subsidio_id: str
@@ -11,11 +16,92 @@ class SubsidyMatch(BaseModel):
     texto_original: str  # Como apareceu no ofício
     similarity_score: float
     periodo: Optional[dict] = None  # {"inicio": "01/01/2023", "fim": "31/12/2023"}
+    carta_circular: Optional[str] = None  # Carta Circular associada
+    requer_de_para: bool = False  # Se requer informações DE/PARA
+
+    # NOVOS CAMPOS - Validação LLM
+    llm_validated: bool = False  # Se passou por validação LLM
+    llm_confidence: Optional[float] = None  # Confidence do LLM (0-1)
+    texto_evidencia: Optional[str] = None  # Frase exata onde foi encontrado
+    justificativa_match: Optional[str] = None  # Por que o LLM achou que é esse subsídio
+    sugestao_exemplo: Optional[str] = None  # Texto para adicionar aos exemplos do catálogo
     
 class SubsidiesExtraction(BaseModel):
     subsidios_solicitados: List[SubsidyMatch]
     total_subsidios: int
     subsidios_nao_identificados: List[str]
+
+# NOVOS MODELOS - Validação LLM
+class LLMSubsidyValidation(BaseModel):
+    """Validação de um subsídio individual pelo LLM"""
+    subsidio_id: str
+    e_valido: bool  # Se o match faz sentido
+    confidence: float  # 0.0 a 1.0
+    texto_evidencia: str  # Frase exata do ofício onde foi encontrado
+    justificativa: str  # Por que o LLM considera que é esse subsídio
+    sugestao_exemplo: str  # Como adicionar aos exemplos do catálogo
+
+class LLMSubsidioNovo(BaseModel):
+    """Subsídio novo identificado pelo LLM que não estava no catálogo"""
+    texto_solicitacao: str  # O que foi solicitado
+    texto_evidencia: str  # Onde aparece no ofício
+    catalogo_id_sugerido: Optional[str] = None  # Se o LLM achar que é variante de algum existente
+    e_subsidio_novo: bool = True  # Se é realmente novo ou variante
+    justificativa: str  # Por que o LLM acha que é novo/variante
+
+class LLMValidationResult(BaseModel):
+    """Resultado completo da validação LLM"""
+    validacoes: List[LLMSubsidyValidation]  # Validação dos matches TF-IDF
+    subsidios_novos: List[LLMSubsidioNovo]  # Subsídios não capturados pelo TF-IDF
+    todos_subsidios_capturados: bool  # Se o LLM acredita que pegou tudo
+    confidence_geral: float  # Confidence geral da extração (0-1)
+    observacoes: Optional[str] = None  # Observações gerais do LLM
+
+def validate_subsidies_with_llm(
+    texto_oficio: str,
+    tfidf_matches: List[SubsidyMatch],
+    unmatched_fragments: List[str],
+    catalogo_completo: pd.DataFrame
+) -> LLMValidationResult:
+    """
+    Valida os matches do TF-IDF usando LLM e identifica subsídios faltantes
+
+    IMPORTANTE: Esta função é um STUB que precisa ser integrado com smolagents.
+    Por enquanto, retorna validação mock.
+
+    Na implementação real, deve:
+    1. Criar prompt estruturado com ofício + matches + catálogo
+    2. Chamar LLM com response_format='json'
+    3. Parsear resposta para LLMValidationResult
+    """
+
+    # TODO: Implementar chamada real ao LLM via smolagents
+    # Por enquanto, retorna validação mock (aceita todos os matches do TF-IDF)
+
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning("validate_subsidies_with_llm chamada com STUB - implementação real necessária")
+
+    # Mock: valida todos os matches como corretos
+    validacoes = []
+    for match in tfidf_matches:
+        validacoes.append(LLMSubsidyValidation(
+            subsidio_id=match.subsidio_id,
+            e_valido=True,
+            confidence=0.9,  # Mock confidence alto
+            texto_evidencia=match.texto_original,
+            justificativa=f"Match TF-IDF com score {match.similarity_score:.2f}",
+            sugestao_exemplo=match.texto_original
+        ))
+
+    # Mock: assume que capturou tudo
+    return LLMValidationResult(
+        validacoes=validacoes,
+        subsidios_novos=[],
+        todos_subsidios_capturados=True,
+        confidence_geral=0.9,
+        observacoes="STUB: Validação LLM não implementada - aceitando matches TF-IDF"
+    )
 
 class SubsidyMatcher:
     def __init__(self, catalog_df: pd.DataFrame):
@@ -118,4 +204,159 @@ def extract_and_match_subsidies(text: str, catalog_path: str) -> SubsidiesExtrac
         subsidios_solicitados=all_matches,
         total_subsidios=len(all_matches),
         subsidios_nao_identificados=unmatched
+    )
+
+@tool
+def extract_and_match_subsidies_hybrid(
+    text: str,
+    catalog_path: str,
+    use_llm_validation: bool = True
+) -> SubsidiesExtraction:
+    """
+    VERSÃO HÍBRIDA: Extrai subsídios usando TF-IDF + Validação LLM
+
+    Arquitetura em 3 fases:
+    1. TF-IDF com threshold baixo (recall alto)
+    2. Validação LLM para confirmar matches e encontrar faltantes
+    3. Consolidação final com evidências textuais
+
+    Args:
+        text: Texto do ofício
+        catalog_path: Path para catálogo CSV
+        use_llm_validation: Se True, usa LLM. Se False, apenas TF-IDF (modo rápido)
+
+    Returns:
+        SubsidiesExtraction com validações LLM incluídas
+    """
+
+    import logging
+    logger = logging.getLogger(__name__)
+
+    catalog_df = pd.read_csv(catalog_path)
+    matcher = SubsidyMatcher(catalog_df)
+
+    # FASE 1: Extração TF-IDF com threshold BAIXO para recall alto
+    logger.info("FASE 1: Extração TF-IDF (threshold 0.50 para recall alto)")
+
+    request_patterns = [
+        r'(?:DETERMINO|SOLICITO|REQUEIRO|OFICIE-SE)(.+?)(?:\n\n|$)',
+        r'(?:forneça|disponibilize|informe|apresente)(.+?)(?:\.|;|\n)',
+        r'(?:extratos?|saldos?|movimenta[çã][õo]es?)(.+?)(?:\.|;|\n)'
+    ]
+
+    all_matches = []
+    unmatched_fragments = []
+
+    for pattern in request_patterns:
+        requests = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
+
+        for request in requests:
+            items = re.split(r'[;,]|\n-|\n\d+\.', request)
+
+            for item in items:
+                if len(item.strip()) > 10:
+                    # Threshold BAIXO (0.50) para pegar mais matches
+                    matches = matcher.find_matches(item.strip(), threshold=0.50)
+
+                    if matches:
+                        best_match = matches[0]
+                        periodo = extract_period_from_text(item)
+
+                        all_matches.append(SubsidyMatch(
+                            subsidio_id=best_match['subsidio_id'],
+                            nome_subsidio=best_match['nome_subsidio'],
+                            texto_original=item.strip(),
+                            similarity_score=best_match['similarity_score'],
+                            periodo=periodo,
+                            llm_validated=False  # Ainda não validado
+                        ))
+                    else:
+                        unmatched_fragments.append(item.strip())
+
+    logger.info(f"TF-IDF encontrou {len(all_matches)} matches, {len(unmatched_fragments)} não identificados")
+
+    # Se não usa LLM, retorna só TF-IDF
+    if not use_llm_validation:
+        logger.info("Modo rápido: retornando apenas TF-IDF sem validação LLM")
+        return SubsidiesExtraction(
+            subsidios_solicitados=all_matches,
+            total_subsidios=len(all_matches),
+            subsidios_nao_identificados=unmatched_fragments
+        )
+
+    # FASE 2: Validação LLM
+    logger.info("FASE 2: Validação LLM de todos os matches")
+
+    llm_validation = validate_subsidies_with_llm(
+        texto_oficio=text,
+        tfidf_matches=all_matches,
+        unmatched_fragments=unmatched_fragments,
+        catalogo_completo=catalog_df
+    )
+
+    # FASE 3: Consolidação - aplica validações LLM aos matches
+    logger.info("FASE 3: Consolidando resultados TF-IDF + LLM")
+
+    final_matches = []
+
+    # Atualiza matches existentes com validações LLM
+    for match in all_matches:
+        # Busca validação correspondente
+        validacao = next(
+            (v for v in llm_validation.validacoes if v.subsidio_id == match.subsidio_id),
+            None
+        )
+
+        if validacao and validacao.e_valido:
+            # Match confirmado pelo LLM - adiciona evidências
+            match.llm_validated = True
+            match.llm_confidence = validacao.confidence
+            match.texto_evidencia = validacao.texto_evidencia
+            match.justificativa_match = validacao.justificativa
+            match.sugestao_exemplo = validacao.sugestao_exemplo
+            final_matches.append(match)
+        elif validacao and not validacao.e_valido:
+            # Match REJEITADO pelo LLM
+            logger.warning(f"LLM rejeitou match {match.nome_subsidio}: {validacao.justificativa}")
+            # Não adiciona à lista final
+        else:
+            # Sem validação LLM (não deveria acontecer)
+            logger.warning(f"Match sem validação LLM: {match.nome_subsidio}")
+            final_matches.append(match)
+
+    # Adiciona subsídios NOVOS identificados pelo LLM
+    for novo in llm_validation.subsidios_novos:
+        if novo.catalogo_id_sugerido:
+            # LLM mapeou para um subsídio existente
+            catalogo_info = catalog_df[
+                catalog_df['subsidio_id'] == novo.catalogo_id_sugerido
+            ].iloc[0]
+
+            final_matches.append(SubsidyMatch(
+                subsidio_id=novo.catalogo_id_sugerido,
+                nome_subsidio=catalogo_info['nome'],
+                texto_original=novo.texto_solicitacao,
+                similarity_score=0.0,  # LLM identificou, não TF-IDF
+                periodo=extract_period_from_text(novo.texto_evidencia),
+                llm_validated=True,
+                llm_confidence=llm_validation.confidence_geral,
+                texto_evidencia=novo.texto_evidencia,
+                justificativa_match=novo.justificativa,
+                sugestao_exemplo=novo.texto_solicitacao
+            ))
+            logger.info(f"LLM adicionou subsídio: {catalogo_info['nome']}")
+
+    logger.info(f"Final: {len(final_matches)} subsídios validados (TF-IDF={len(all_matches)}, Novos LLM={len(llm_validation.subsidios_novos)})")
+
+    # Subsídios não identificados = aqueles que o LLM também não conseguiu mapear
+    subsidios_verdadeiramente_nao_identificados = [
+        novo.texto_solicitacao
+        for novo in llm_validation.subsidios_novos
+        if novo.e_subsidio_novo and not novo.catalogo_id_sugerido
+    ]
+
+    return SubsidiesExtraction(
+        subsidios_solicitados=final_matches,
+        total_subsidios=len(final_matches),
+        subsidios_nao_identificados=subsidios_verdadeiramente_nao_identificados
     )

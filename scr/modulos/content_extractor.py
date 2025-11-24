@@ -1,4 +1,3 @@
-
 # 2. Agent de Extração de Conteúdo Relevante
 # Este agente extrai apenas as partes relevantes do texto, especialmente quando há cadeia de emails:
 
@@ -6,10 +5,24 @@
 def extract_oficio_content(text: str, input_classification: InputClassification) -> str:
     """
     Extrai apenas o conteúdo do ofício de uma cadeia de emails ou texto misto
+    Agora também processa marcadores <<OCR>>
     """
+    
+    # NOVO: Se tem marcadores <<OCR>>, extrai o conteúdo entre eles primeiro
+    if input_classification.tem_marcador_ocr:
+        ocr_pattern = r'<<OCR>>(.*?)<<OCR>>'
+        ocr_matches = re.findall(ocr_pattern, text, re.DOTALL)
+        if ocr_matches:
+            # Concatena todos os blocos OCR encontrados
+            ocr_content = '\n\n'.join(ocr_matches)
+            # Se encontrou conteúdo OCR, usa ele como base
+            text = ocr_content
+    
+    # Se já é ofício completo (sem email chain), retorna o texto
     if input_classification.tipo_conteudo == "oficio_completo":
         return text
     
+    # Se é email chain, busca blocos de ofício
     if input_classification.tipo_conteudo == "email_chain":
         # Estratégia: encontrar o bloco mais longo que contém marcadores de ofício
         blocks = text.split('\n\n')
@@ -39,6 +52,13 @@ def extract_minimal_info_for_lookup(text: str) -> dict:
         "nomes": [],
         "pode_consultar_sistema": False
     }
+    
+    # NOVO: Se tem marcadores OCR, processa o conteúdo dentro deles primeiro
+    ocr_pattern = r'<<OCR>>(.*?)<<OCR>>'
+    ocr_matches = re.findall(ocr_pattern, text, re.DOTALL)
+    if ocr_matches:
+        # Usa o conteúdo OCR concatenado para busca
+        text = '\n\n'.join(ocr_matches)
     
     # Extrai números de processo
     processos = re.findall(r'\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}', text)
