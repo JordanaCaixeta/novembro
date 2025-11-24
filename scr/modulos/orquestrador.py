@@ -29,6 +29,11 @@ from scr.modulos.datas_management import (
 from scr.modulos.carta_circular import extract_carta_circular
 from scr.modulos.DE_PARA_detector import detect_de_para_requirements
 from scr.modulos.instituicao_filter import filter_by_institution, FiltroInstituicaoResult
+from scr.modulos.ccs_validation import (
+    get_ccs_relations,
+    validate_all_parties_ccs,
+    CCSValidationResult
+)
 
 class WarrantProcessingResult(BaseModel):
     session_id: str
@@ -167,12 +172,60 @@ class WarrantOrchestrator(CodeAgent):
         
         # STEP 4: Processamento paralelo de extração
         # (Em produção, isso seria paralelizado de verdade)
-        
+
         # Extrai investigados
         parties_result = extract_all_investigated_parties(oficio_content)
         if parties_result.tem_mais_investigados_possiveis:
             alertas.append("Possíveis investigados adicionais não capturados")
-        
+
+        # STEP 4.5: Validação CCS - Verifica se investigados são clientes do Banco X
+        investigados_validados = []
+        tem_pelo_menos_um_cliente = False
+
+        for party in parties_result.investigados:
+            party_dict = party.model_dump()
+            cpf_cnpj = party_dict.get("cpf") or party_dict.get("cnpj")
+
+            if cpf_cnpj:
+                try:
+                    ccs_result = get_ccs_relations(cpf_cnpj)
+
+                    # Enriquece dados do investigado
+                    party_dict["validado_ccs"] = True
+                    party_dict["tem_vinculo_banco"] = ccs_result.tem_vinculo
+
+                    if ccs_result.tem_vinculo:
+                        tem_pelo_menos_um_cliente = True
+                        party_dict["nome_ccs"] = ccs_result.nome_completo
+                        party_dict["produtos_ativos"] = len(ccs_result.produtos_ativos)
+                        party_dict["cliente_desde"] = ccs_result.cliente_desde
+                        party_dict["tempo_relacionamento_dias"] = ccs_result.tempo_relacionamento_total_dias
+                        party_dict["tipos_relacionamento"] = list(set([r.tipo for r in ccs_result.relacionamentos]))
+                        party_dict["tipos_produtos"] = list(set([p.tipo for p in ccs_result.produtos_ativos]))
+
+                        alertas.append(f"✓ {party.nome} é cliente do Banco X ({len(ccs_result.produtos_ativos)} produtos)")
+                    else:
+                        party_dict["alerta_ccs"] = "CPF/CNPJ não possui vínculo com Banco X"
+                        alertas.append(f"⚠ {party.nome} NÃO é cliente do Banco X")
+
+                except Exception as e:
+                    party_dict["validado_ccs"] = False
+                    party_dict["tem_vinculo_banco"] = None
+                    party_dict["alerta_ccs"] = f"Erro na validação CCS: {str(e)}"
+                    alertas.append(f"⚠ Erro ao validar {party.nome} no CCS")
+            else:
+                party_dict["validado_ccs"] = False
+                party_dict["tem_vinculo_banco"] = None
+                party_dict["alerta_ccs"] = "Sem CPF/CNPJ para validação"
+
+            # Reconstrói o objeto InvestigatedParty (Pydantic não aceita campos extras diretamente)
+            # Mantém a lista original mas adiciona alertas
+            investigados_validados.append(party)
+
+        # Se nenhum investigado é cliente, ajusta confidence
+        if parties_result.investigados and not tem_pelo_menos_um_cliente:
+            alertas.append("ALERTA CRÍTICO: Nenhum investigado possui vínculo com Banco X")
+
         # Extrai e faz match de subsídios (VERSÃO HÍBRIDA com validação LLM)
         subsidies_result = extract_and_match_subsidies_hybrid(
             oficio_content,
@@ -229,11 +282,21 @@ class WarrantOrchestrator(CodeAgent):
         if not parties_result.investigados:
             alertas.append("CRÍTICO: Nenhum investigado identificado")
             confidence_geral *= 0.5
-        
+
         if not subsidies_result.subsidios_solicitados:
             alertas.append("CRÍTICO: Nenhum subsídio identificado")
             confidence_geral *= 0.5
-        
+
+        # NOVO: Ajuste de confidence baseado em validação CCS
+        if parties_result.investigados and not tem_pelo_menos_um_cliente:
+            # Investigados identificados, mas nenhum é cliente do banco
+            confidence_geral *= 0.6  # Redução significativa
+            alertas.append("ALERTA: Quebra de sigilo para não-clientes do banco")
+        elif tem_pelo_menos_um_cliente:
+            # Pelo menos um investigado é cliente - aumenta confidence
+            confidence_geral *= 1.1  # Pequeno boost
+            confidence_geral = min(confidence_geral, 1.0)  # Cap em 1.0
+
         # NOVO: Ajuste de confidence para ofício complementar
         if classification.tipo_oficio == "complemento":
             confidence_geral *= 0.9  # Pequena redução por ser complementar

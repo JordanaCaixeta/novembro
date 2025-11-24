@@ -66,41 +66,191 @@ def validate_subsidies_with_llm(
     """
     Valida os matches do TF-IDF usando LLM e identifica subsídios faltantes
 
-    IMPORTANTE: Esta função é um STUB que precisa ser integrado com smolagents.
-    Por enquanto, retorna validação mock.
+    Implementação REAL com smolagents LiteLLMModel
 
-    Na implementação real, deve:
-    1. Criar prompt estruturado com ofício + matches + catálogo
-    2. Chamar LLM com response_format='json'
-    3. Parsear resposta para LLMValidationResult
+    Args:
+        texto_oficio: Texto completo do ofício
+        tfidf_matches: Matches identificados pelo TF-IDF
+        unmatched_fragments: Fragmentos não identificados pelo TF-IDF
+        catalogo_completo: DataFrame com catálogo de subsídios
+
+    Returns:
+        LLMValidationResult com validações e subsídios novos identificados
     """
 
-    # TODO: Implementar chamada real ao LLM via smolagents
-    # Por enquanto, retorna validação mock (aceita todos os matches do TF-IDF)
-
     import logging
+    import json
+    import os
     logger = logging.getLogger(__name__)
-    logger.warning("validate_subsidies_with_llm chamada com STUB - implementação real necessária")
 
-    # Mock: valida todos os matches como corretos
+    try:
+        from smolagents import LiteLLMModel
+    except ImportError:
+        logger.error("smolagents não instalado - usando fallback STUB")
+        return _validate_subsidies_stub(tfidf_matches)
+
+    # Prepara catálogo resumido (primeiros 50 para não estourar contexto)
+    catalogo_resumido = catalogo_completo.head(50).to_dict('records')
+    catalogo_text = "\n".join([
+        f"ID: {row['subsidio_id']} | Nome: {row['nome']} | Descrição: {row.get('descricao', 'N/A')}"
+        for row in catalogo_resumido
+    ])
+
+    # Prepara matches do TF-IDF
+    matches_text = "\n".join([
+        f"Match {i+1}: {m.nome_subsidio} (ID: {m.subsidio_id}, Score: {m.similarity_score:.2f})\n"
+        f"  Texto encontrado: \"{m.texto_original}\""
+        for i, m in enumerate(tfidf_matches)
+    ]) if tfidf_matches else "Nenhum match identificado pelo TF-IDF"
+
+    # Prepara fragmentos não identificados
+    fragments_text = "\n".join([
+        f"- {frag}" for frag in unmatched_fragments
+    ]) if unmatched_fragments else "Nenhum fragmento não identificado"
+
+    # Prompt estruturado
+    prompt = f"""Você é um especialista em análise de ofícios judiciais de quebra de sigilo bancário.
+
+Sua tarefa é validar a extração de subsídios (tipos de documentos solicitados) de um ofício.
+
+## OFÍCIO COMPLETO:
+```
+{texto_oficio}
+```
+
+## SUBSÍDIOS JÁ IDENTIFICADOS PELO SISTEMA (TF-IDF):
+{matches_text}
+
+## FRAGMENTOS NÃO IDENTIFICADOS:
+{fragments_text}
+
+## CATÁLOGO DE SUBSÍDIOS DISPONÍVEIS (primeiros 50):
+{catalogo_text}
+
+---
+
+## SUAS TAREFAS:
+
+### 1. VALIDAR MATCHES DO TF-IDF
+Para cada match identificado, responda:
+- Ele realmente faz sentido no contexto do ofício?
+- Qual é a frase EXATA do ofício onde o subsídio foi mencionado?
+- Por que você considera que esse match está correto (ou incorreto)?
+- Como essa solicitação poderia ser adicionada aos exemplos do catálogo? (texto curto e genérico)
+
+### 2. IDENTIFICAR SUBSÍDIOS FALTANTES
+- Há algum subsídio solicitado no ofício que NÃO está na lista de matches?
+- Se sim, qual é a frase exata onde aparece?
+- Esse subsídio existe no catálogo ou é totalmente novo?
+
+### 3. MAPEAR FRAGMENTOS NÃO IDENTIFICADOS
+- Os fragmentos não identificados correspondem a algum subsídio do catálogo?
+- Se sim, qual?
+
+---
+
+## FORMATO DE RESPOSTA (JSON):
+
+Retorne APENAS um objeto JSON válido no seguinte formato:
+
+{{
+  "validacoes": [
+    {{
+      "subsidio_id": "1",
+      "e_valido": true,
+      "confidence": 0.95,
+      "texto_evidencia": "Solicito extratos de conta corrente",
+      "justificativa": "O ofício solicita explicitamente extratos de conta corrente, match correto",
+      "sugestao_exemplo": "extratos de conta corrente;movimentações bancárias"
+    }}
+  ],
+  "subsidios_novos": [
+    {{
+      "texto_solicitacao": "informações sobre cartões corporativos",
+      "texto_evidencia": "Determino o fornecimento de informações sobre cartões corporativos",
+      "catalogo_id_sugerido": "3",
+      "e_subsidio_novo": false,
+      "justificativa": "Corresponde ao subsídio 'Cartão de Crédito' (ID 3) mas com wording diferente"
+    }}
+  ],
+  "todos_subsidios_capturados": false,
+  "confidence_geral": 0.85,
+  "observacoes": "O ofício solicita 5 subsídios, mas o TF-IDF capturou apenas 3. Identifiquei 2 faltantes."
+}}
+
+## INSTRUÇÕES IMPORTANTES:
+1. Seja rigoroso na validação - rejeite matches que não fazem sentido
+2. Extraia a frase EXATA do ofício (não parafraseie)
+3. A sugestão de exemplo deve ser curta e genérica para o catálogo
+4. Se um fragmento não identificado é variante de um subsídio existente, mapeie para o catalogo_id
+5. Confidence deve refletir sua certeza (0.0 = incerto, 1.0 = absoluto)
+6. Retorne APENAS o JSON, sem texto adicional
+"""
+
+    # Chama LLM
+    try:
+        # Usa modelo configurado via env ou default
+        model_id = os.getenv("LLM_MODEL_ID", "gpt-4o-mini")  # Padrão: GPT-4o-mini (barato e preciso)
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+
+        if not api_key:
+            logger.warning("LLM API key não configurada - usando fallback STUB")
+            return _validate_subsidies_stub(tfidf_matches)
+
+        llm = LiteLLMModel(
+            model_id=model_id,
+            api_key=api_key
+        )
+
+        logger.info(f"Chamando LLM ({model_id}) para validação de subsídios...")
+
+        response = llm([{"role": "user", "content": prompt}])
+
+        # Parse JSON da resposta
+        # Remove markdown code blocks se houver
+        response_text = response.strip()
+        if response_text.startswith("```"):
+            # Remove ```json e ``` do início e fim
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+            response_text = response_text.strip()
+
+        result_dict = json.loads(response_text)
+
+        # Converte para modelo Pydantic
+        return LLMValidationResult(**result_dict)
+
+    except json.JSONDecodeError as e:
+        logger.error(f"LLM retornou JSON inválido: {e}")
+        logger.error(f"Resposta: {response_text[:500]}")
+        return _validate_subsidies_stub(tfidf_matches)
+
+    except Exception as e:
+        logger.error(f"Erro na validação LLM: {e}")
+        return _validate_subsidies_stub(tfidf_matches)
+
+def _validate_subsidies_stub(tfidf_matches: List[SubsidyMatch]) -> LLMValidationResult:
+    """
+    Fallback: Valida subsídios sem LLM (aceita matches do TF-IDF)
+    """
     validacoes = []
     for match in tfidf_matches:
         validacoes.append(LLMSubsidyValidation(
             subsidio_id=match.subsidio_id,
             e_valido=True,
-            confidence=0.9,  # Mock confidence alto
+            confidence=0.9,
             texto_evidencia=match.texto_original,
-            justificativa=f"Match TF-IDF com score {match.similarity_score:.2f}",
+            justificativa=f"Match TF-IDF com score {match.similarity_score:.2f} (LLM indisponível)",
             sugestao_exemplo=match.texto_original
         ))
 
-    # Mock: assume que capturou tudo
     return LLMValidationResult(
         validacoes=validacoes,
         subsidios_novos=[],
         todos_subsidios_capturados=True,
-        confidence_geral=0.9,
-        observacoes="STUB: Validação LLM não implementada - aceitando matches TF-IDF"
+        confidence_geral=0.85,
+        observacoes="FALLBACK: Validação LLM indisponível - aceitando matches TF-IDF"
     )
 
 class SubsidyMatcher:
