@@ -2,6 +2,37 @@
 
 Sistema inteligente baseado em **smolagents** para análise automatizada de ofícios judiciais de quebra de sigilo bancário.
 
+**Integrado com ambiente IaraGenAI do Banco X** usando modelos OpenAI.
+
+---
+
+## 🔧 Configuração - Ambiente Banco X
+
+### Modelos OpenAI Configurados
+
+| Tipo | Modelo | Uso |
+|------|--------|-----|
+| `fast` | gpt-5-nano | Tarefas simples e rápidas |
+| `reasoning` | gpt-5 | Raciocínio complexo (orquestrador) |
+| `precision` | gpt-5-mini | Alta precisão (validação subsídios) |
+
+### Variáveis de Ambiente
+
+```bash
+# Copie .env.example para .env e configure:
+cp .env.example .env
+
+# Credenciais obrigatórias:
+BANCO_X_CLIENT_ID=seu_client_id
+BANCO_X_CLIENT_SECRET=seu_client_secret
+BANCO_X_ENVIRONMENT=dev  # dev, hml, prod
+```
+
+### Arquivos de Integração
+
+- `scr/modulos/config.py` - Configuração de modelos (MODEL_CONFIG)
+- `scr/modulos/llm_client.py` - Cliente IaraGenAI para Banco X
+
 ---
 
 ## 🎯 Visão Geral
@@ -83,15 +114,15 @@ O sistema processa textos OCR de ofícios judiciais altamente variados, ruidosos
   - ⚠️ "Quebra de sigilo para não-clientes" → Alertas críticos
 - Fallback gracioso se API CCS indisponível
 
-### 10. Validação LLM para Subsídios (extract_subsidios.py) - ✨ NOVO
-- **Implementação REAL** com smolagents LiteLLMModel (não é mais STUB)
+### 10. Validação LLM para Subsídios (extract_subsidios.py) - ✨ ATUALIZADO
+- **Implementação com IaraGenAI do Banco X**
 - Valida matches do TF-IDF com LLM
 - Identifica subsídios faltantes que TF-IDF não capturou
 - Extrai frase EXATA do ofício (texto evidência)
 - Retorna justificativa do match
 - Sugere exemplos para alimentar catálogo
-- **Modelo padrão**: GPT-4o-mini (barato + preciso)
-- Configurável via `OPENAI_API_KEY` e `LLM_MODEL_ID`
+- **Modelo**: gpt-5-mini (precision) via IaraGenAI
+- Configurado automaticamente via variáveis de ambiente do Banco X
 - Fallback para TF-IDF se LLM indisponível
 - Aumenta precisão de 85% → 98%
 

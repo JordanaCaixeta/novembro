@@ -66,7 +66,7 @@ def validate_subsidies_with_llm(
     """
     Valida os matches do TF-IDF usando LLM e identifica subsídios faltantes
 
-    Implementação REAL com smolagents LiteLLMModel
+    Implementação com IaraGenAI do Banco X
 
     Args:
         texto_oficio: Texto completo do ofício
@@ -84,9 +84,9 @@ def validate_subsidies_with_llm(
     logger = logging.getLogger(__name__)
 
     try:
-        from smolagents import LiteLLMModel
+        from scr.modulos.llm_client import IaraLLMModel
     except ImportError:
-        logger.error("smolagents não instalado - usando fallback STUB")
+        logger.error("llm_client não disponível - usando fallback STUB")
         return _validate_subsidies_stub(tfidf_matches)
 
     # Prepara catálogo resumido (primeiros 50 para não estourar contexto)
@@ -187,22 +187,12 @@ Retorne APENAS um objeto JSON válido no seguinte formato:
 6. Retorne APENAS o JSON, sem texto adicional
 """
 
-    # Chama LLM
+    # Chama LLM via IaraGenAI do Banco X
     try:
-        # Usa modelo configurado via env ou default
-        model_id = os.getenv("LLM_MODEL_ID", "gpt-4o-mini")  # Padrão: GPT-4o-mini (barato e preciso)
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+        # Usa modelo 'precision' (gpt-5-mini) para validação de subsídios
+        llm = IaraLLMModel(model_type="precision")
 
-        if not api_key:
-            logger.warning("LLM API key não configurada - usando fallback STUB")
-            return _validate_subsidies_stub(tfidf_matches)
-
-        llm = LiteLLMModel(
-            model_id=model_id,
-            api_key=api_key
-        )
-
-        logger.info(f"Chamando LLM ({model_id}) para validação de subsídios...")
+        logger.info(f"Chamando LLM ({llm.model_id}) via IaraGenAI para validação de subsídios...")
 
         response = llm([{"role": "user", "content": prompt}])
 

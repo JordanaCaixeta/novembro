@@ -1,19 +1,25 @@
 # 8. Integração com Smolagents - Configuração Completa
-from smolagents import CodeAgent, ManagedAgent, HfApiModel
+# Adaptado para ambiente Banco X com IaraGenAI
+from smolagents import CodeAgent, ManagedAgent
 import logging
+
+from .llm_client import get_smolagents_model, IaraLLMModel
+from .config import MODEL_CONFIG
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class MultiAgentWarrantProcessor:
     def __init__(self, catalog_path: str, models_config: dict = None):
-        
-        # Configuração de modelos
+
+        # Configuração de modelos - usa IaraGenAI do Banco X
+        # Modelos: gpt-5-nano (fast), gpt-5 (reasoning), gpt-5-mini (precision)
         self.models = models_config or {
-            'fast': HfApiModel("Qwen/Qwen2.5-Coder-32B-Instruct"),
-            'reasoning': HfApiModel("deepseek-ai/DeepSeek-R1"),
-            'precision': HfApiModel("gpt-4o")
+            'fast': get_smolagents_model("fast"),           # gpt-5-nano
+            'reasoning': get_smolagents_model("reasoning"), # gpt-5
+            'precision': get_smolagents_model("precision")  # gpt-5-mini
         }
         
         # Agentes especializados

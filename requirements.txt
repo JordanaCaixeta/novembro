@@ -1,0 +1,36 @@
+# =============================================================================
+# Dependências do projeto Novembro - Integração OpenAI Banco X
+# =============================================================================
+
+# Cliente OpenAI
+openai>=1.0.0
+
+# IaraGenAI - Cliente do Banco X (instalar via repositório interno)
+# pip install iara-genai --extra-index-url https://pypi.interno.bancox.com/simple
+# iara-genai
+
+# Smolagents - Framework de agentes
+smolagents>=0.1.0
+
+# Machine Learning
+scikit-learn>=1.0.0
+
+# Processamento de dados
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Validação de dados
+pydantic>=2.0.0
+
+# Utilitários de datas
+python-dateutil>=2.8.0
+
+# Configuração de ambiente
+python-dotenv>=1.0.0
+
+# Logging
+structlog>=23.0.0
+
+# HTTP requests
+requests>=2.28.0
+httpx>=0.24.0

@@ -1,10 +1,13 @@
 # 6. Orchestrator Agent Principal
 # Coordena todo o fluxo considerando os cenários possíveis:
+# Adaptado para ambiente Banco X com IaraGenAI
 
 import uuid
 from typing import List, Optional, Literal
 from pydantic import BaseModel
-from smolagents import CodeAgent, HfApiModel
+from smolagents import CodeAgent
+
+from scr.modulos.llm_client import get_smolagents_model
 
 # Importa funções e classes dos outros módulos
 from scr.modulos.datamanagement import (
@@ -51,8 +54,9 @@ class WarrantProcessingResult(BaseModel):
 class WarrantOrchestrator(CodeAgent):
     def __init__(self, catalog_path: str):
         self.catalog_path = catalog_path
+        # Usa modelo 'reasoning' (gpt-5) via IaraGenAI do Banco X
         super().__init__(
-            model=HfApiModel("deepseek-ai/DeepSeek-R1"),
+            model=get_smolagents_model("reasoning"),  # gpt-5
             name="warrant_orchestrator",
             description="Coordena processamento completo de ofícios",
             max_steps=30
