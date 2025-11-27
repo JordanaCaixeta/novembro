@@ -1,0 +1,97 @@
+{
+  "payload_entrada": {
+    "data_oficio": "2024-03-15",
+    "data_recebimento_oficio": "2024-03-18",
+    "orgao_demandante": "1ª Vara Criminal de São Paulo",
+    "numero_processo": "0001234-56.2024.8.26.0001",
+    "numero_oficio": "OF-2024/001234",
+    "resumo_oficio": "Quebra de sigilo bancário referente a investigação de lavagem de dinheiro",
+    "duplicidade": false,
+    "oficios_duplicados": ["OF-2024/001233"],
+    "prazo_judicial": 15,
+    "envolvidos": [
+      {
+        "numero_documento_envolvido": "123.456.789-00",
+        "nome_envolvido": "João da Silva",
+        "id_cliente": null
+      }
+    ]
+  },
+  "payload_saida": {
+    "data_oficio": "2024-03-15",
+    "data_recebimento_oficio": "2024-03-18",
+    "orgao_demandante": "1ª Vara Criminal de São Paulo",
+    "numero_processo": "0001234-56.2024.8.26.0001",
+    "numero_oficio": "OF-2024/001234",
+    "resumo_oficio": "Quebra de sigilo bancário referente a investigação de lavagem de dinheiro",
+    "duplicidade": false,
+    "oficios_duplicados": ["OF-2024/001233"],
+    "prazo_judicial": 15,
+    "envolvidos": [
+      {
+        "numero_documento_envolvido": "123.456.789-00",
+        "tipo_documento": "PF",
+        "nome_envolvido": "João da Silva",
+        "id_cliente": "CLI-2024-009999",
+        "flag_relacionamento": true,
+        "periodo_relacionamento_inicio": "2018-05-10",
+        "periodo_relacionamento_fim": null,
+        "produtos": [
+          {
+            "tipo_produto": "CONTA_CORRENTE",
+            "numero_banco": "341",
+            "agencia": "0001",
+            "conta": "123456-7",
+            "origem_sistema": "CCS"
+          },
+          {
+            "tipo_produto": "CARTAO_CREDITO",
+            "numero_banco": "341",
+            "agencia": "0001",
+            "conta": "123456-7",
+            "origem_sistema": "INTERNO"
+          }
+        ],
+        "subsidios": [
+          {
+            "id_subsidio": "SUB-001",
+            "nome_subsidio": "EXTRATO_CONTA_CORRENTE",
+            "codigos_relacionados": ["COD-EXT-001", "COD-EXT-002", "COD-MOV-015"],
+            "trecho_identificado": "extratos de movimentação bancária dos últimos 5 anos",
+            "justificativa_agente": "O trecho menciona explicitamente 'extratos de movimentação bancária', correspondendo ao subsídio EXTRATO_CONTA_CORRENTE do catálogo",
+            "metodo_identificacao": "HEURISTICA",
+            "periodo_quebra_inicio": "2019-03-18",
+            "periodo_quebra_fim": "2024-03-18",
+            "periodo_quebra_texto_original": "últimos 5 anos",
+            "confianca_classificacao": 0.95,
+            "flag_di4": true,
+            "id_arquivo_di4": "DI4-2024-00123456"
+          },
+          {
+            "id_subsidio": "SUB-015",
+            "nome_subsidio": "HISTORICO_PIX",
+            "codigos_relacionados": ["COD-PIX-001"],
+            "trecho_identificado": "todas as transações via PIX realizadas",
+            "justificativa_agente": "Menção explícita a 'transações via PIX' corresponde ao subsídio HISTORICO_PIX",
+            "metodo_identificacao": "LLM",
+            "periodo_quebra_inicio": "2020-11-16",
+            "periodo_quebra_fim": "2024-03-18",
+            "periodo_quebra_texto_original": "desde a implantação do PIX",
+            "confianca_classificacao": 0.92,
+            "flag_di4": false,
+            "id_arquivo_di4": null
+          }
+        ]
+      }
+    ],
+    "qualidade_ocr": {
+      "score": 0.87,
+      "tag": "ALTA",
+      "recomenda_revisao_manual": false
+    },
+    "tipo_oficio": {
+      "tipo": "PRIMEIRO",
+      "observacoes": null
+    }
+  }
+}
