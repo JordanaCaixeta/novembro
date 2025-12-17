@@ -1,0 +1,1199 @@
+# 6. ETAPA DE VALIDAÇÃO
+# Versão atualizada com:
+# - Normalização de dados (chave única nome|documento)
+# - Separação por analisar_isolado (grupo conjunto vs isolado)
+# - TF-IDF roda 1 vez só (resultado reaproveitado)
+# - LLM roda N vezes (1 para conjunto + 1 para cada isolado)
+# - Penalização apenas para gap promovido (sem ORIGEM_DESTINO)
+# - Agrupamento de múltiplos trechos do mesmo id_subsidio
+
+import re
+import json
+import logging
+import concurrent.futures
+import pandas as pd
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
+from smolagents import tool
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ============================================================
+# CONFIGURAÇÃO DE LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("extract_subsidios")
+
+# ============================================================
+# MODELOS PYDANTIC
+# ============================================================
+
+class TrechoMatch(BaseModel):
+    """Um trecho encontrado pelo TF-IDF"""
+    trecho: str
+    similaridade: float
+    posicao_texto: Optional[int] = None
+
+class ValidacaoTFIDF(BaseModel):
+    """Resultado da validação TF-IDF para um subsídio"""
+    nota: float
+    flag_possivel_alucinacao: bool = False
+    trechos_encontrados: List[TrechoMatch] = []
+    total_matches: int = 0
+    gap_identificado: bool = False
+
+class ValidacaoLLM(BaseModel):
+    """Resultado da validação LLM para um subsídio"""
+    nota: float
+    confirmacao: str  # CONFIRMADO | REJEITADO | PROMOVIDO
+    justificativa: str
+    texto_evidencia: Optional[str] = None
+    sugestao_exemplo: Optional[str] = None
+
+class Penalizacoes(BaseModel):
+    """Penalizações aplicadas ao subsídio"""
+    gap_promovido: bool = False
+    valor_total: float = 0.0
+
+class SubsidioValidado(BaseModel):
+    """Resultado completo da validação de um subsídio"""
+    id_subsidio: str
+    classificacao_previa: Dict[str, Any]
+    validacao_tfidf: Optional[ValidacaoTFIDF] = None
+    validacao_llm: Optional[ValidacaoLLM] = None
+    penalizacoes: Optional[Penalizacoes] = None
+    score_final: Optional[float] = None
+    flag_presenca_final: str
+    decisao_final: str  # MANTIDO | REJEITADO
+
+class ResultadoEnvolvido(BaseModel):
+    """Resultado da validação para um envolvido específico"""
+    chave_envolvido: str
+    nome: str
+    numero_documento_envolvido: str
+    analisar_isolado: str
+    tipo_grupo: str  # "conjunto" | "isolado"
+    subsidios_validados: Dict[str, Any]
+
+# ============================================================
+# FUNÇÕES DE NORMALIZAÇÃO
+# ============================================================
+
+def criar_chave_envolvido(nome: str, documento: str) -> str:
+    """
+    Cria chave única para o envolvido
+    Formato: "NOME|DOCUMENTO" (normalizado)
+    """
+    nome_norm = nome.strip().upper() if nome else "SEM_NOME"
+    doc_norm = documento.strip() if documento and documento.upper() != "NÃO IDENTIFICADO" else "SEM_DOC"
+    return f"{nome_norm}|{doc_norm}"
+
+
+def normalizar_dados_envolvidos(nome_cpf: dict, lista_subs: list) -> list:
+    """
+    Junta nome_cpf com listaSubs e adiciona chave única
+    
+    Args:
+        nome_cpf: dict com 'envolvidos' contendo nome, cpf, analisar_isolado
+        lista_subs: lista de dicts com numero_documento_envolvido e subsidios
+    
+    Returns:
+        Lista de envolvidos com estrutura unificada
+    """
+    logger.info("Iniciando normalização de dados dos envolvidos")
+    
+    # Cria mapeamento de envolvidos com nome e analisar_isolado (por CPF)
+    envolvidos_map = {}
+    for env in nome_cpf.get('envolvidos', []):
+        cpf = env.get('cpf', '')
+        envolvidos_map[cpf] = {
+            'nome': env.get('nome', ''),
+            'analisar_isolado': env.get('analisar_isolado', 'nao').lower()
+        }
+    
+    logger.info(f"Mapeamento de envolvidos criado: {len(envolvidos_map)} envolvidos")
+    
+    # Enriquece listaSubs com dados de nome_cpf
+    resultado = []
+    for sub in lista_subs:
+        doc = sub.get('numero_documento_envolvido', '')
+        
+        # Busca dados do envolvido pelo documento
+        env_data = envolvidos_map.get(doc, {})
+        nome = env_data.get('nome', '')
+        analisar_isolado = env_data.get('analisar_isolado', 'sim')  # Default 'sim' se não encontrar
+        
+        # Cria chave única
+        chave = criar_chave_envolvido(nome, doc)
+        
+        # Desaninha subsidios.subsidios
+        subsidios_raw = sub.get('subsidios', {})
+        if isinstance(subsidios_raw, dict) and 'subsidios' in subsidios_raw:
+            subsidios = subsidios_raw.get('subsidios', {})
+        else:
+            subsidios = subsidios_raw
+        
+        resultado.append({
+            'chave_envolvido': chave,
+            'nome': nome,
+            'numero_documento_envolvido': doc,
+            'analisar_isolado': analisar_isolado,
+            'tipo_documento': sub.get('tipo_documento', ''),
+            'id_cliente': sub.get('id_cliente', ''),
+            'flag_relacionamento': sub.get('flag_relacionamento', ''),
+            'produtos': sub.get('produtos', ''),
+            'subsidios': subsidios
+        })
+        
+        logger.info(f"Envolvido normalizado: {chave} (analisar_isolado={analisar_isolado})")
+    
+    return resultado
+
+
+# ============================================================
+# CLASSE SUBSIDY MATCHER (TF-IDF)
+# ============================================================
+
+class SubsidyMatcher:
+    def __init__(self, catalog_df: pd.DataFrame):
+        """
+        catalog_df deve ter colunas: 
+        - subsidio_id
+        - nome
+        - descricao  
+        - exemplos (string com exemplos separados por ;)
+        """
+        self.catalog = catalog_df
+        
+        # Prepara corpus para TF-IDF
+        corpus = []
+        self.id_mapping = []
+        
+        for idx, row in catalog_df.iterrows():
+            # Combina nome, descrição e exemplos
+            text_representation = f"{row['nome']} {row['descricao']}"
+            if row.get('exemplos'):
+                text_representation += " " + str(row['exemplos'])
+            corpus.append(text_representation)
+            self.id_mapping.append(row['subsidio_id'])
+        
+        # Cria vetorizador TF-IDF
+        self.vectorizer = TfidfVectorizer(
+            analyzer='char_wb',
+            ngram_range=(3, 5),
+            lowercase=True
+        )
+        self.catalog_vectors = self.vectorizer.fit_transform(corpus)
+        
+        logger.info(f"SubsidyMatcher inicializado com {len(corpus)} subsídios no catálogo")
+    
+    def find_matches(self, requested_text: str, threshold: float = 0.3) -> List[dict]:
+        """
+        Encontra subsídios correspondentes no catálogo
+        """
+        if not requested_text or len(requested_text.strip()) < 3:
+            return []
+        
+        # Vetoriza o texto solicitado
+        request_vector = self.vectorizer.transform([requested_text])
+        
+        # Calcula similaridades
+        similarities = cosine_similarity(request_vector, self.catalog_vectors)[0]
+        
+        # Encontra melhores matches
+        matches = []
+        for idx, score in enumerate(similarities):
+            if score >= threshold:
+                matches.append({
+                    'subsidio_id': self.id_mapping[idx],
+                    'nome_subsidio': self.catalog.iloc[idx]['nome'],
+                    'similarity_score': float(score)
+                })
+        
+        return sorted(matches, key=lambda x: x['similarity_score'], reverse=True)
+    
+    def find_all_matches_for_subsidy(
+        self, 
+        texto_original: str, 
+        id_subsidio: str, 
+        threshold: float = 0.3
+    ) -> List[dict]:
+        """
+        Busca todos os trechos do texto que correspondem a um subsídio específico
+        Retorna lista de matches com trecho, similaridade e posição
+        """
+        # Obtém informações do subsídio no catálogo
+        subsidio_info = self.catalog[self.catalog['subsidio_id'] == id_subsidio]
+        if subsidio_info.empty:
+            logger.warning(f"Subsídio {id_subsidio} não encontrado no catálogo")
+            return []
+        
+        subsidio_row = subsidio_info.iloc[0]
+        subsidio_text = f"{subsidio_row['nome']} {subsidio_row['descricao']} {subsidio_row.get('exemplos', '')}"
+        subsidio_vector = self.vectorizer.transform([subsidio_text])
+        
+        # Quebra texto em fragmentos (sentenças/frases)
+        fragmentos = re.split(r'[.;]\s*|\n', texto_original)
+        
+        matches = []
+        posicao_atual = 0
+        
+        for fragmento in fragmentos:
+            fragmento_clean = fragmento.strip()
+            if len(fragmento_clean) < 10:
+                posicao_atual += len(fragmento) + 1
+                continue
+            
+            # Vetoriza o fragmento
+            frag_vector = self.vectorizer.transform([fragmento_clean])
+            
+            # Calcula similaridade com o subsídio
+            similarity = cosine_similarity(frag_vector, subsidio_vector)[0][0]
+            
+            if similarity >= threshold:
+                matches.append({
+                    'texto': fragmento_clean,
+                    'similarity_score': float(similarity),
+                    'posicao': posicao_atual
+                })
+            
+            posicao_atual += len(fragmento) + 1
+        
+        return sorted(matches, key=lambda x: x['similarity_score'], reverse=True)
+
+
+# ============================================================
+# FUNÇÕES DE VALIDAÇÃO TF-IDF
+# ============================================================
+
+def validar_tfidf_presenca_sim(
+    id_subsidio: str,
+    trecho_classificacao: str,
+    texto_original: str,
+    matcher: SubsidyMatcher,
+    threshold: float = 0.3,
+    caso_id: str = "N/A"
+) -> ValidacaoTFIDF:
+    """
+    Para flag_presenca=SIM:
+    - Verifica se trecho existe no texto original (anti-alucinação)
+    - Agrupa múltiplos matches do mesmo subsídio
+    """
+    logger.info(f"[CASO:{caso_id}] [{id_subsidio}] Validando TF-IDF (presença=SIM)")
+    
+    # 1. Verifica se trecho da classificação existe no texto (anti-alucinação)
+    trecho_lower = trecho_classificacao.lower().strip() if trecho_classificacao else ""
+    texto_lower = texto_original.lower()
+    
+    # Busca substring ou similaridade alta
+    trecho_encontrado = trecho_lower in texto_lower if trecho_lower else False
+    
+    # Se não encontrou exato, tenta similaridade
+    if not trecho_encontrado and trecho_lower:
+        trecho_vector = matcher.vectorizer.transform([trecho_lower])
+        texto_vector = matcher.vectorizer.transform([texto_lower])
+        sim = cosine_similarity(trecho_vector, texto_vector)[0][0]
+        trecho_encontrado = sim > 0.7
+        if trecho_encontrado:
+            logger.info(f"[CASO:{caso_id}] [{id_subsidio}] Trecho encontrado por similaridade (sim={sim:.2f})")
+    
+    if not trecho_encontrado:
+        logger.warning(f"[CASO:{caso_id}] [{id_subsidio}] Trecho da classificação NÃO encontrado no texto original - POSSÍVEL ALUCINAÇÃO")
+    
+    # 2. Busca todos os matches no texto para este subsídio
+    matches = matcher.find_all_matches_for_subsidy(texto_original, id_subsidio, threshold)
+    
+    # 3. Agrupa matches (remove duplicatas muito similares)
+    trechos_unicos = []
+    trechos_vistos = set()
+    
+    for m in matches:
+        trecho_norm = m['texto'].lower().strip()[:50]  # Primeiros 50 chars para comparação
+        if trecho_norm not in trechos_vistos:
+            trechos_unicos.append(TrechoMatch(
+                trecho=m['texto'],
+                similaridade=m['similarity_score'],
+                posicao_texto=m.get('posicao')
+            ))
+            trechos_vistos.add(trecho_norm)
+    
+    # 4. Calcula nota
+    if trecho_encontrado and len(trechos_unicos) > 0:
+        nota = max(t.similaridade for t in trechos_unicos)
+    elif trecho_encontrado:
+        nota = 0.7  # Encontrou trecho mas sem match TF-IDF forte
+    else:
+        nota = 0.3  # Possível alucinação
+    
+    logger.info(f"[CASO:{caso_id}] [{id_subsidio}] TF-IDF nota={nota:.2f}, matches={len(trechos_unicos)}, alucinacao={not trecho_encontrado}")
+    
+    return ValidacaoTFIDF(
+        nota=nota,
+        flag_possivel_alucinacao=not trecho_encontrado,
+        trechos_encontrados=trechos_unicos,
+        total_matches=len(trechos_unicos),
+        gap_identificado=False
+    )
+
+
+def validar_tfidf_presenca_nao(
+    id_subsidio: str,
+    texto_original: str,
+    matcher: SubsidyMatcher,
+    threshold: float = 0.4,
+    caso_id: str = "N/A"
+) -> Optional[ValidacaoTFIDF]:
+    """
+    Para flag_presenca=NÃO:
+    - Busca match entre texto original × descrição/exemplos do catálogo
+    - Se encontrar → gap identificado (vai para LLM validar)
+    - Se não encontrar → retorna None (campos zerados)
+    """
+    logger.info(f"[CASO:{caso_id}] [{id_subsidio}] Buscando gaps no texto (presença=NÃO)")
+    
+    # Busca matches no texto para este subsídio
+    matches = matcher.find_all_matches_for_subsidy(texto_original, id_subsidio, threshold)
+    
+    if not matches:
+        logger.info(f"[CASO:{caso_id}] [{id_subsidio}] Nenhum gap encontrado - mantém NÃO")
+        return None
+    
+    logger.warning(f"[CASO:{caso_id}] [{id_subsidio}] GAP IDENTIFICADO - {len(matches)} match(es) encontrado(s)")
+    
+    # Agrupa matches
+    trechos_unicos = []
+    trechos_vistos = set()
+    
+    for m in matches:
+        trecho_norm = m['texto'].lower().strip()[:50]
+        if trecho_norm not in trechos_vistos:
+            trechos_unicos.append(TrechoMatch(
+                trecho=m['texto'],
+                similaridade=m['similarity_score'],
+                posicao_texto=m.get('posicao')
+            ))
+            trechos_vistos.add(trecho_norm)
+    
+    nota = max(t.similaridade for t in trechos_unicos)
+    
+    return ValidacaoTFIDF(
+        nota=nota,
+        flag_possivel_alucinacao=False,
+        trechos_encontrados=trechos_unicos,
+        total_matches=len(trechos_unicos),
+        gap_identificado=True
+    )
+
+
+def executar_tfidf(
+    texto_oficio: str,
+    classificacao_llm: Dict[str, Dict],
+    catalog_df: pd.DataFrame,
+    caso_id: str = "N/A"
+) -> Dict[str, Optional[ValidacaoTFIDF]]:
+    """
+    Executa TF-IDF para todos os subsídios da classificação prévia
+    RODA 1 VEZ SÓ - resultado é reaproveitado para todos os envolvidos
+    """
+    logger.info(f"[CASO:{caso_id}] ===== EXECUTANDO TF-IDF (1 vez) =====")
+    logger.info(f"[CASO:{caso_id}] Total de subsídios na classificação prévia: {len(classificacao_llm)}")
+    
+    matcher = SubsidyMatcher(catalog_df)
+    resultados_tfidf = {}
+    
+    for id_subsidio, dados in classificacao_llm.items():
+        flag_presenca = dados.get('flag_presenca', '').upper()
+        
+        if flag_presenca == 'SIM':
+            resultados_tfidf[id_subsidio] = validar_tfidf_presenca_sim(
+                id_subsidio=id_subsidio,
+                trecho_classificacao=dados.get('trecho_identificado'),
+                texto_original=texto_oficio,
+                matcher=matcher,
+                caso_id=caso_id
+            )
+        else:
+            resultados_tfidf[id_subsidio] = validar_tfidf_presenca_nao(
+                id_subsidio=id_subsidio,
+                texto_original=texto_oficio,
+                matcher=matcher,
+                caso_id=caso_id
+            )
+    
+    # Resumo
+    total_com_resultado = sum(1 for v in resultados_tfidf.values() if v is not None)
+    total_gaps = sum(1 for v in resultados_tfidf.values() if v and v.gap_identificado)
+    total_alucinacao = sum(1 for v in resultados_tfidf.values() if v and v.flag_possivel_alucinacao)
+    
+    logger.info(f"[CASO:{caso_id}] TF-IDF finalizado: {total_com_resultado} com resultado, {total_gaps} gaps, {total_alucinacao} possíveis alucinações")
+    
+    return resultados_tfidf
+
+
+# ============================================================
+# FUNÇÕES DE VALIDAÇÃO LLM
+# ============================================================
+
+def montar_prompt_validacao(
+    texto_oficio: str,
+    resultados_tfidf: Dict[str, Optional[ValidacaoTFIDF]],
+    envolvidos: List[Dict],
+    classificacao_llm: Dict[str, Dict],
+    catalogo_text: str
+) -> str:
+    """
+    Monta o prompt de validação para a LLM
+    MESMO PROMPT para todos - só muda a variável 'envolvidos'
+    """
+    
+    # Monta string dos envolvidos (1 ou N, não importa)
+    envolvidos_str = "\n".join([
+        f"- Nome: {e.get('nome', 'N/A')}, Documento: {e.get('numero_documento_envolvido', 'N/A')}" 
+        for e in envolvidos
+    ])
+    
+    # Monta string dos matches TF-IDF
+    tfidf_str_parts = []
+    for id_sub, tfidf in resultados_tfidf.items():
+        if tfidf is not None:
+            status = "GAP" if tfidf.gap_identificado else ("ALUCINAÇÃO?" if tfidf.flag_possivel_alucinacao else "OK")
+            trechos = "; ".join([f'"{t.trecho[:100]}..." (sim={t.similaridade:.2f})' for t in tfidf.trechos_encontrados[:3]])
+            tfidf_str_parts.append(f"- {id_sub}: nota={tfidf.nota:.2f}, status={status}, matches={tfidf.total_matches}\n  Trechos: {trechos if trechos else 'N/A'}")
+    
+    tfidf_str = "\n".join(tfidf_str_parts) if tfidf_str_parts else "Nenhum match TF-IDF"
+    
+    # Monta string da classificação prévia
+    classif_str_parts = []
+    for id_sub, dados in classificacao_llm.items():
+        flag = dados.get('flag_presenca', 'N/A')
+        trecho = dados.get('trecho_identificado', '')[:100] if dados.get('trecho_identificado') else 'N/A'
+        justif = dados.get('justificativa_agente', '')[:100] if dados.get('justificativa_agente') else 'N/A'
+        classif_str_parts.append(f"- {id_sub}: flag={flag}\n  Trecho: {trecho}\n  Justificativa: {justif}")
+    
+    classif_str = "\n".join(classif_str_parts)
+    
+    return f"""
+## PERSONA
+Você é um especialista em análise de ofícios judiciais de quebra de sigilo bancário.
+
+## OBJETIVO
+Validar a extração de subsídios (tipos de documentos solicitados) para o(s) envolvido(s) especificado(s).
+
+## ENVOLVIDO(S) SENDO ANALISADO(S)
+{envolvidos_str}
+
+## OFÍCIO COMPLETO
+```
+{texto_oficio}
+```
+
+## SUBSÍDIOS IDENTIFICADOS PELO SISTEMA (TF-IDF)
+{tfidf_str}
+
+## CLASSIFICAÇÃO PRÉVIA POR LLM (para cada ID de subsídio)
+{classif_str}
+
+## CATÁLOGO DE SUBSÍDIOS DISPONÍVEIS
+{catalogo_text}
+
+---
+
+## SUAS TAREFAS
+
+### 1. VALIDAR MATCHES DO TF-IDF
+Para cada match identificado, responda:
+- Há termos similares ou contexto indicando solicitação?
+- Ele realmente faz sentido no contexto do ofício?
+- A solicitação se aplica ao(s) envolvido(s) acima?
+- Qual é a frase EXATA do ofício onde o subsídio foi mencionado?
+- A sua localização no texto é depois de termos de solicitação (como por exemplo DETERMINO|SOLICITO|REQUEIRO|OFICIE-SE, ou sinônimos), caso o ofício apresente esses termos? 
+- Por que você considera que esse match está correto (ou incorreto)?
+- Ele foi identificado pela *CLASSIFICAÇÃO POR LLM*?
+- Como essa solicitação poderia ser adicionada aos exemplos do catálogo? (texto curto e genérico)
+
+### 2. VALIDAR GAPS (flag_presenca=NÃO mas TF-IDF encontrou match)
+- O gap identificado é válido?
+- A classificação prévia errou ao marcar como NÃO?
+- A solicitação se aplica ao(s) envolvido(s) sendo analisado(s)?
+
+### 3. IDENTIFICAR SUBSÍDIOS FALTANTES
+- Há algum subsídio solicitado no ofício que NÃO está na lista de matches?
+- Se sim, analise o 'trecho_identificado' com a frase exata onde ele aparece e a 'justificativa_agente'
+- A *CLASSIFICAÇÃO POR LLM* está correta?
+- Esse subsídio existe no catálogo ou é totalmente novo?
+
+### 4. MAPEAR FRAGMENTOS NÃO IDENTIFICADOS
+- Os fragmentos não identificados correspondem a algum subsídio do catálogo?
+- Se sim, qual?
+
+---
+
+## FORMATO DE RESPOSTA (JSON)
+
+Retorne APENAS um objeto JSON válido no seguinte formato:
+
+{{
+  "validacoes": [
+    {{
+      "subsidio_id": "ID_DO_SUBSIDIO",
+      "e_valido": true,
+      "confidence": 0.95,
+      "texto_evidencia": "Frase EXATA do ofício onde foi encontrado",
+      "justificativa": "Por que o match está correto ou incorreto",
+      "sugestao_exemplo": "texto curto para adicionar aos exemplos do catálogo"
+    }}
+  ],
+  "subsidios_novos": [
+    {{
+      "texto_solicitacao": "o que foi solicitado",
+      "texto_evidencia": "onde aparece no ofício",
+      "catalogo_id_sugerido": "ID se for variante de existente, null se novo",
+      "e_subsidio_novo": false,
+      "justificativa": "explicação"
+    }}
+  ],
+  "todos_subsidios_capturados": false,
+  "confidence_geral": 0.85,
+  "observacoes": "Observações gerais sobre a validação"
+}}
+
+## INSTRUÇÕES IMPORTANTES
+1. Rejeite matches que não fazem sentido
+2. No caso de incerteza, considere o texto **OFÍCIO COMPLETO** para apoiar nas respostas
+3. Extraia a frase EXATA do ofício (não parafraseie)
+4. A sugestão de exemplo deve ser curta e genérica para o catálogo
+5. Se um fragmento não identificado é variante de um subsídio existente, mapeie para o catalogo_id
+6. Confidence deve refletir sua certeza (0.0 = incerto, 1.0 = absoluto)
+7. Retorne APENAS o JSON, sem texto adicional
+8. Considere se os subsídios se aplicam ao(s) envolvido(s) sendo analisado(s)
+"""
+
+
+def validar_llm_subsidios(
+    texto_oficio: str,
+    resultados_tfidf: Dict[str, Optional[ValidacaoTFIDF]],
+    envolvidos: List[Dict],
+    classificacao_llm: Dict[str, Dict],
+    catalog_df: pd.DataFrame,
+    caso_id: str = "N/A"
+) -> Dict[str, ValidacaoLLM]:
+    """
+    Valida subsídios com LLM
+    Recebe lista de envolvidos (1 para isolado, N para conjunto)
+    """
+    
+    # Identifica quem está sendo validado para o log
+    if len(envolvidos) == 1:
+        env_log = envolvidos[0].get('chave_envolvido', 'N/A')
+        logger.info(f"[CASO:{caso_id}] [ENV:{env_log}] Validando LLM (isolado)")
+    else:
+        env_log = f"CONJUNTO ({len(envolvidos)} envolvidos)"
+        logger.info(f"[CASO:{caso_id}] [{env_log}] Validando LLM")
+    
+    # Prepara texto do catálogo
+    catalogo_text = "\n".join([
+        f"- {row['subsidio_id']}: {row['nome']} - {row['descricao']}"
+        for _, row in catalog_df.head(50).iterrows()
+    ])
+    
+    # Monta prompt
+    prompt = montar_prompt_validacao(
+        texto_oficio=texto_oficio,
+        resultados_tfidf=resultados_tfidf,
+        envolvidos=envolvidos,
+        classificacao_llm=classificacao_llm,
+        catalogo_text=catalogo_text
+    )
+    
+    # Chama LLM
+    try:
+        from smolagents import LiteLLMModel
+        
+        # TODO: Configurar modelo conforme ambiente
+        # model = LiteLLMModel(model_id="gpt-4o")
+        
+        # Por enquanto, simula chamada (substituir pela implementação real)
+        import os
+        
+        # Se tiver API key configurada, faz chamada real
+        if os.getenv("OPENAI_API_KEY"):
+            import openai
+            client = openai.OpenAI()
+            
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="gpt-4o",
+                response_format={"type": "json_object"}
+            )
+            
+            result_dict = json.loads(response.choices[0].message.content)
+        else:
+            logger.warning(f"[CASO:{caso_id}] API key não configurada - retornando validação mock")
+            result_dict = {
+                "validacoes": [],
+                "subsidios_novos": [],
+                "todos_subsidios_capturados": True,
+                "confidence_geral": 0.5,
+                "observacoes": "Validação mock - API key não configurada"
+            }
+        
+    except Exception as e:
+        logger.error(f"[CASO:{caso_id}] Erro na chamada LLM: {str(e)}")
+        result_dict = {
+            "validacoes": [],
+            "subsidios_novos": [],
+            "todos_subsidios_capturados": False,
+            "confidence_geral": 0.0,
+            "observacoes": f"Erro: {str(e)}"
+        }
+    
+    # Converte resultado para dict de ValidacaoLLM por id_subsidio
+    validacoes_llm = {}
+    
+    for validacao in result_dict.get('validacoes', []):
+        id_sub = validacao.get('subsidio_id')
+        if id_sub:
+            confirmacao = "CONFIRMADO" if validacao.get('e_valido') else "REJEITADO"
+            validacoes_llm[id_sub] = ValidacaoLLM(
+                nota=validacao.get('confidence', 0.5),
+                confirmacao=confirmacao,
+                justificativa=validacao.get('justificativa', ''),
+                texto_evidencia=validacao.get('texto_evidencia'),
+                sugestao_exemplo=validacao.get('sugestao_exemplo')
+            )
+    
+    # Processa gaps promovidos (subsidios_novos que mapeiam para catálogo)
+    for novo in result_dict.get('subsidios_novos', []):
+        id_sugerido = novo.get('catalogo_id_sugerido')
+        if id_sugerido and not novo.get('e_subsidio_novo', True):
+            validacoes_llm[id_sugerido] = ValidacaoLLM(
+                nota=result_dict.get('confidence_geral', 0.5),
+                confirmacao="PROMOVIDO",
+                justificativa=novo.get('justificativa', 'Gap promovido'),
+                texto_evidencia=novo.get('texto_evidencia')
+            )
+    
+    logger.info(f"[CASO:{caso_id}] LLM retornou {len(validacoes_llm)} validações")
+    
+    return validacoes_llm, result_dict
+
+
+# ============================================================
+# FUNÇÕES DE PENALIZAÇÃO E SCORE
+# ============================================================
+
+def calcular_penalizacoes(
+    id_subsidio: str,
+    validacao_tfidf: Optional[ValidacaoTFIDF],
+    caso_id: str = "N/A"
+) -> Optional[Penalizacoes]:
+    """
+    Calcula penalizações para um subsídio
+    - Gap promovido: penaliza
+    - ORIGEM_DESTINO: REMOVIDO (não penaliza mais)
+    """
+    if validacao_tfidf is None:
+        return None
+    
+    penalizacoes = Penalizacoes()
+    
+    # Verifica se foi gap promovido
+    if validacao_tfidf.gap_identificado:
+        logger.info(f"[CASO:{caso_id}] [{id_subsidio}] Penalização por gap promovido")
+        penalizacoes.gap_promovido = True
+        penalizacoes.valor_total += 0.15
+    
+    return penalizacoes
+
+
+def calcular_score_final(
+    validacao_tfidf: Optional[ValidacaoTFIDF],
+    validacao_llm: Optional[ValidacaoLLM],
+    penalizacoes: Optional[Penalizacoes],
+    caso_id: str = "N/A",
+    id_subsidio: str = "N/A"
+) -> tuple:
+    """
+    Calcula score final e decisão
+    
+    Returns:
+        (score_final, decisao_final)
+    """
+    if validacao_tfidf is None:
+        return None, "REJEITADO"
+    
+    # Pesos (configuráveis)
+    PESO_TFIDF = 0.4
+    PESO_LLM = 0.6
+    THRESHOLD = 0.5
+    
+    nota_tfidf = validacao_tfidf.nota
+    nota_llm = validacao_llm.nota if validacao_llm else 0.5
+    
+    score = (nota_tfidf * PESO_TFIDF) + (nota_llm * PESO_LLM)
+    
+    # Aplica penalizações
+    if penalizacoes:
+        score = score * (1 - penalizacoes.valor_total)
+    
+    decisao = "MANTIDO" if score >= THRESHOLD else "REJEITADO"
+    
+    logger.info(f"[CASO:{caso_id}] [{id_subsidio}] Score final={score:.3f}, decisão={decisao}")
+    
+    return round(score, 3), decisao
+
+
+# ============================================================
+# FUNÇÕES DE CONSOLIDAÇÃO
+# ============================================================
+
+def consolidar_resultado_envolvido(
+    envolvido: Dict,
+    resultados_tfidf: Dict[str, Optional[ValidacaoTFIDF]],
+    resultado_llm: tuple,
+    classificacao_llm: Dict[str, Dict],
+    tipo_grupo: str,
+    caso_id: str = "N/A"
+) -> Dict[str, Any]:
+    """
+    Consolida resultado para um envolvido específico
+    """
+    validacoes_llm, llm_raw = resultado_llm
+    
+    subsidios_validados = {}
+    
+    for id_subsidio, dados_previa in classificacao_llm.items():
+        tfidf = resultados_tfidf.get(id_subsidio)
+        llm = validacoes_llm.get(id_subsidio)
+        
+        # Calcula penalizações
+        penalizacoes = calcular_penalizacoes(id_subsidio, tfidf, caso_id)
+        
+        # Calcula score final
+        score, decisao = calcular_score_final(tfidf, llm, penalizacoes, caso_id, id_subsidio)
+        
+        # Determina flag_presenca_final
+        flag_final = dados_previa.get('flag_presenca', 'NÃO')
+        if tfidf and tfidf.gap_identificado and llm and llm.confirmacao == "PROMOVIDO":
+            flag_final = "SIM"
+        elif llm and llm.confirmacao == "REJEITADO":
+            flag_final = "NÃO"
+        
+        subsidios_validados[id_subsidio] = {
+            "id_subsidio": id_subsidio,
+            "classificacao_previa": dados_previa,
+            "validacao_tfidf": tfidf.model_dump() if tfidf else None,
+            "validacao_llm": llm.model_dump() if llm else None,
+            "penalizacoes": penalizacoes.model_dump() if penalizacoes else None,
+            "score_final": score,
+            "flag_presenca_final": flag_final,
+            "decisao_final": decisao
+        }
+    
+    return {
+        "chave_envolvido": envolvido.get('chave_envolvido'),
+        "nome": envolvido.get('nome'),
+        "numero_documento_envolvido": envolvido.get('numero_documento_envolvido'),
+        "analisar_isolado": envolvido.get('analisar_isolado'),
+        "tipo_grupo": tipo_grupo,
+        "subsidios_validados": subsidios_validados
+    }
+
+
+# ============================================================
+# FUNÇÃO PRINCIPAL
+# ============================================================
+
+def exec_validacao_completa(
+    texto_oficio: str,
+    classificacao_llm: Dict[str, Dict],
+    lista_envolvidos: List[Dict],
+    catalog_path: str,
+    caso_id: str = "N/A"
+) -> Dict:
+    """
+    Executa validação completa:
+    1. Normalização (se necessário)
+    2. Separação por analisar_isolado
+    3. TF-IDF (1 vez só)
+    4. LLM (N vezes: 1 conjunto + 1 por isolado)
+    5. Penalizações e score
+    """
+    logger.info(f"[CASO:{caso_id}] ========== INICIANDO VALIDAÇÃO COMPLETA ==========")
+    logger.info(f"[CASO:{caso_id}] Subsídios na classificação prévia: {len(classificacao_llm)}")
+    logger.info(f"[CASO:{caso_id}] Envolvidos: {len(lista_envolvidos)}")
+    
+    # Carrega catálogo
+    catalog_df = load_catalog(catalog_path)
+    
+    # 1. SEPARAÇÃO POR analisar_isolado
+    grupo_isolado = [e for e in lista_envolvidos if e.get('analisar_isolado', 'nao').lower() == 'sim']
+    grupo_conjunto = [e for e in lista_envolvidos if e.get('analisar_isolado', 'nao').lower() == 'nao']
+    
+    logger.info(f"[CASO:{caso_id}] Grupo isolado: {len(grupo_isolado)} envolvidos")
+    logger.info(f"[CASO:{caso_id}] Grupo conjunto: {len(grupo_conjunto)} envolvidos")
+    
+    # 2. TF-IDF (1 VEZ SÓ)
+    resultados_tfidf = executar_tfidf(texto_oficio, classificacao_llm, catalog_df, caso_id)
+    
+    # 3. MONTA LISTA DE EXECUÇÕES LLM
+    execucoes = []
+    
+    if grupo_conjunto:
+        execucoes.append({
+            "envolvidos": grupo_conjunto,
+            "tipo": "conjunto"
+        })
+        logger.info(f"[CASO:{caso_id}] Adicionada 1 execução LLM para grupo conjunto ({len(grupo_conjunto)} envolvidos)")
+    
+    for env in grupo_isolado:
+        execucoes.append({
+            "envolvidos": [env],
+            "tipo": "isolado"
+        })
+        logger.info(f"[CASO:{caso_id}] Adicionada execução LLM isolada para {env.get('chave_envolvido', 'N/A')}")
+    
+    logger.info(f"[CASO:{caso_id}] Total de chamadas LLM programadas: {len(execucoes)}")
+    
+    # 4. EXECUTA LLM (MESMO PROMPT, VARIÁVEL ATUALIZADA)
+    resultados_por_envolvido = []
+    
+    for i, exec_info in enumerate(execucoes):
+        envolvidos_para_validar = exec_info["envolvidos"]
+        tipo = exec_info["tipo"]
+        
+        # Log identificando quem está sendo validado
+        if tipo == "conjunto":
+            logger.info(f"[CASO:{caso_id}] [EXEC {i+1}/{len(execucoes)}] Validando CONJUNTO: {[e.get('chave_envolvido', 'N/A') for e in envolvidos_para_validar]}")
+        else:
+            logger.info(f"[CASO:{caso_id}] [EXEC {i+1}/{len(execucoes)}] [ENV:{envolvidos_para_validar[0].get('chave_envolvido', 'N/A')}] Validando ISOLADO")
+        
+        # MESMO PROMPT, só muda a variável de envolvidos
+        resultado_llm = validar_llm_subsidios(
+            texto_oficio=texto_oficio,
+            resultados_tfidf=resultados_tfidf,
+            envolvidos=envolvidos_para_validar,
+            classificacao_llm=classificacao_llm,
+            catalog_df=catalog_df,
+            caso_id=caso_id
+        )
+        
+        # 5. CONSOLIDA E ASSOCIA A CADA ENVOLVIDO
+        for env in envolvidos_para_validar:
+            resultado_consolidado = consolidar_resultado_envolvido(
+                envolvido=env,
+                resultados_tfidf=resultados_tfidf,
+                resultado_llm=resultado_llm,
+                classificacao_llm=classificacao_llm,
+                tipo_grupo=tipo,
+                caso_id=caso_id
+            )
+            resultados_por_envolvido.append(resultado_consolidado)
+    
+    logger.info(f"[CASO:{caso_id}] ========== VALIDAÇÃO COMPLETA FINALIZADA ==========")
+    
+    # Calcula metadata
+    total_mantidos = 0
+    total_rejeitados = 0
+    for res in resultados_por_envolvido:
+        for sub in res['subsidios_validados'].values():
+            if sub['decisao_final'] == 'MANTIDO':
+                total_mantidos += 1
+            else:
+                total_rejeitados += 1
+    
+    return {
+        "caso_id": caso_id,
+        "resultado_tfidf": {k: v.model_dump() if v else None for k, v in resultados_tfidf.items()},
+        "resultado_por_envolvido": resultados_por_envolvido,
+        "metadata": {
+            "total_envolvidos": len(lista_envolvidos),
+            "envolvidos_isolados": len(grupo_isolado),
+            "envolvidos_conjunto": len(grupo_conjunto),
+            "chamadas_llm": len(execucoes),
+            "total_subsidios_catalogo": len(catalog_df),
+            "total_mantidos": total_mantidos,
+            "total_rejeitados": total_rejeitados
+        }
+    }
+
+
+# ============================================================
+# FUNÇÕES DE CARREGAMENTO DO CATÁLOGO
+# ============================================================
+
+def load_catalog(catalog_path: str) -> pd.DataFrame:
+    """
+    Carrega catálogo de subsídios do JSON
+    """
+    with open(catalog_path, 'r', encoding='utf-8') as f:
+        json_data = json.load(f)
+
+    catalog_list = []
+    for id_subsidio, detalhes in json_data.get("ID_SUBSIDIO", {}).items():
+        id_formatado = id_subsidio.replace(".", " ")
+        nome_formatado = f"{id_formatado}: {detalhes.get('Descricao', 'N/A')}"
+
+        catalog_list.append({
+            "subsidio_id": id_subsidio,
+            "nome": nome_formatado,
+            "descricao": detalhes.get("Descricao", "N/A"),
+            "exemplos": "; ".join(detalhes.get("Termos", []))
+        })
+
+    catalog_df = pd.DataFrame(catalog_list)
+    logger.info(f"Catálogo carregado: {len(catalog_df)} subsídios")
+    return catalog_df
+
+
+# ============================================================
+# FUNÇÕES DE EXECUÇÃO (INTERFACE COM DATAFRAME)
+# ============================================================
+
+def exec_valida(
+    text: str,
+    nome_cpf: dict,
+    lista_subs: list,
+    catalog_path: str,
+    caso_id: str = "N/A"
+) -> Dict:
+    """
+    Função de execução que processa um caso
+    
+    Args:
+        text: texto_limpo do ofício
+        nome_cpf: dict com envolvidos (nome, cpf, analisar_isolado)
+        lista_subs: lista com classificação prévia por envolvido
+        catalog_path: caminho do catálogo
+        caso_id: identificador do caso
+    
+    Returns:
+        Resultado da validação completa
+    """
+    if not text or not isinstance(text, str) or text.strip() == "":
+        logger.warning(f"[CASO:{caso_id}] Texto vazio ou nulo")
+        return {"status": "texto vazio ou nulo", "caso_id": caso_id}
+    
+    try:
+        # 1. Normaliza dados
+        envolvidos_normalizados = normalizar_dados_envolvidos(nome_cpf, lista_subs)
+        
+        # 2. Extrai classificação prévia (usa do primeiro envolvido como base, 
+        #    pois a classificação é a mesma antes de separar por envolvido)
+        if not envolvidos_normalizados:
+            logger.warning(f"[CASO:{caso_id}] Nenhum envolvido encontrado")
+            return {"status": "nenhum envolvido", "caso_id": caso_id}
+        
+        classificacao_llm = envolvidos_normalizados[0].get('subsidios', {})
+        
+        # 3. Executa validação completa
+        resultado = exec_validacao_completa(
+            texto_oficio=text,
+            classificacao_llm=classificacao_llm,
+            lista_envolvidos=envolvidos_normalizados,
+            catalog_path=catalog_path,
+            caso_id=caso_id
+        )
+        
+        return resultado
+        
+    except Exception as e:
+        logger.error(f"[CASO:{caso_id}] Erro na validação: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"erro": str(e), "caso_id": caso_id}
+
+
+def processar_valida(row: dict, catalog_path: str = None) -> Dict:
+    """
+    Processa validação para uma linha do DataFrame
+    
+    Args:
+        row: linha do DataFrame com texto_limpo, nome_cpf, listaSubs
+        catalog_path: caminho do catálogo (opcional, usa default se não informado)
+    
+    Returns:
+        Resultado da validação
+    """
+    if catalog_path is None:
+        catalog_path = "/home/sagemaker-user/SIMBA/03_12_limpo/data/KB/catalogo_subsidios.json"
+    
+    texto_base = row.get("texto_limpo", "")
+    nome_cpf = row.get("nome_cpf", {})
+    lista_subs = row.get("listaSubs", [])
+    caso_id = row.get("caso_id", row.get("id", "N/A"))
+    
+    return exec_valida(
+        text=texto_base,
+        nome_cpf=nome_cpf,
+        lista_subs=lista_subs,
+        catalog_path=catalog_path,
+        caso_id=str(caso_id)
+    )
+
+
+def valida_classificacoes(df_temp: pd.DataFrame, catalog_path: str = None, max_workers: int = 10) -> pd.DataFrame:
+    """
+    Processa validação para todo o DataFrame em paralelo
+    
+    Args:
+        df_temp: DataFrame com colunas texto_limpo, nome_cpf, listaSubs
+        catalog_path: caminho do catálogo
+        max_workers: número de workers paralelos
+    
+    Returns:
+        DataFrame com coluna results_valida adicionada
+    """
+    logger.info(f"Iniciando validação para {len(df_temp)} casos")
+    
+    rows = df_temp.to_dict(orient="records")
+    
+    def processar_row(row):
+        return processar_valida(row, catalog_path)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        resultados = list(executor.map(processar_row, rows))
+    
+    df_temp["results_valida"] = resultados
+    
+    logger.info(f"Validação concluída para {len(df_temp)} casos")
+    return df_temp
+
+
+# ============================================================
+# EXEMPLO DE USO
+# ============================================================
+
+if __name__ == "__main__":
+    # Exemplo de dados de entrada
+    exemplo_nome_cpf = {
+        'envolvidos': [
+            {'nome': 'João Silva', 'cpf': '123.456.789-00', 'analisar_isolado': 'sim'}, 
+            {'nome': 'Maria Souza', 'cpf': '987.654.321-00', 'analisar_isolado': 'nao'},
+            {'nome': 'Pedro Santos', 'cpf': '111.222.333-44', 'analisar_isolado': 'nao'}
+        ]
+    }
+    
+    exemplo_lista_subs = [
+        {
+            'numero_documento_envolvido': '123.456.789-00',
+            'tipo_documento': '',
+            'id_cliente': '',
+            'flag_relacionamento': '',
+            'produtos': '',
+            'subsidios': {'subsidios': {
+                "EXTRATO_PUC": {
+                    "flag_presenca": "SIM",
+                    "trecho_identificado": "extratos de conta corrente dos últimos 5 anos",
+                    "justificativa_agente": "menciona extratos bancários explicitamente"
+                },
+                "ORIGEM_DESTINO": {
+                    "flag_presenca": "SIM",
+                    "trecho_identificado": "origem e destino das transferências",
+                    "justificativa_agente": "solicita rastreamento de movimentações"
+                },
+                "PIX": {
+                    "flag_presenca": "NÃO",
+                    "trecho_identificado": None,
+                    "justificativa_agente": None
+                }
+            }}
+        },
+        {
+            'numero_documento_envolvido': '987.654.321-00',
+            'tipo_documento': '',
+            'id_cliente': '',
+            'flag_relacionamento': '',
+            'produtos': '',
+            'subsidios': {'subsidios': {
+                "EXTRATO_PUC": {
+                    "flag_presenca": "SIM",
+                    "trecho_identificado": "extratos de conta corrente dos últimos 5 anos",
+                    "justificativa_agente": "menciona extratos bancários explicitamente"
+                },
+                "ORIGEM_DESTINO": {
+                    "flag_presenca": "SIM",
+                    "trecho_identificado": "origem e destino das transferências",
+                    "justificativa_agente": "solicita rastreamento de movimentações"
+                },
+                "PIX": {
+                    "flag_presenca": "NÃO",
+                    "trecho_identificado": None,
+                    "justificativa_agente": None
+                }
+            }}
+        },
+        {
+            'numero_documento_envolvido': '111.222.333-44',
+            'tipo_documento': '',
+            'id_cliente': '',
+            'flag_relacionamento': '',
+            'produtos': '',
+            'subsidios': {'subsidios': {
+                "EXTRATO_PUC": {
+                    "flag_presenca": "SIM",
+                    "trecho_identificado": "extratos de conta corrente dos últimos 5 anos",
+                    "justificativa_agente": "menciona extratos bancários explicitamente"
+                },
+                "ORIGEM_DESTINO": {
+                    "flag_presenca": "SIM",
+                    "trecho_identificado": "origem e destino das transferências",
+                    "justificativa_agente": "solicita rastreamento de movimentações"
+                },
+                "PIX": {
+                    "flag_presenca": "NÃO",
+                    "trecho_identificado": None,
+                    "justificativa_agente": None
+                }
+            }}
+        }
+    ]
+    
+    exemplo_texto = """
+    PODER JUDICIÁRIO
+    COMARCA DE SÃO PAULO
+    
+    DETERMINO a quebra de sigilo bancário de:
+    - JOÃO SILVA, CPF 123.456.789-00
+    - MARIA SOUZA, CPF 987.654.321-00
+    - PEDRO SANTOS, CPF 111.222.333-44
+    
+    OFICIE-SE ao Banco X para que forneça no prazo de 10 dias:
+    
+    1. Extratos de conta corrente dos últimos 5 anos;
+    2. Origem e destino de todas as transferências realizadas;
+    3. Informações sobre cartões de crédito vinculados.
+    
+    São Paulo, 01 de dezembro de 2025.
+    """
+    
+    # Testa normalização
+    print("=== TESTE NORMALIZAÇÃO ===")
+    envolvidos_norm = normalizar_dados_envolvidos(exemplo_nome_cpf, exemplo_lista_subs)
+    for env in envolvidos_norm:
+        print(f"  {env['chave_envolvido']} - analisar_isolado={env['analisar_isolado']}")
+    
+    print("\n=== ESTRUTURA DE EXECUÇÕES ===")
+    grupo_isolado = [e for e in envolvidos_norm if e['analisar_isolado'] == 'sim']
+    grupo_conjunto = [e for e in envolvidos_norm if e['analisar_isolado'] == 'nao']
+    
+    print(f"Grupo isolado ({len(grupo_isolado)}): {[e['chave_envolvido'] for e in grupo_isolado]}")
+    print(f"Grupo conjunto ({len(grupo_conjunto)}): {[e['chave_envolvido'] for e in grupo_conjunto]}")
+    
+    execucoes = []
+    if grupo_conjunto:
+        execucoes.append({"tipo": "conjunto", "envolvidos": grupo_conjunto})
+    for env in grupo_isolado:
+        execucoes.append({"tipo": "isolado", "envolvidos": [env]})
+    
+    print(f"\nTotal de chamadas LLM: {len(execucoes)}")
+    for i, ex in enumerate(execucoes):
+        if ex['tipo'] == 'conjunto':
+            print(f"  Exec {i+1}: CONJUNTO com {len(ex['envolvidos'])} envolvidos")
+        else:
+            print(f"  Exec {i+1}: ISOLADO - {ex['envolvidos'][0]['chave_envolvido']}")
