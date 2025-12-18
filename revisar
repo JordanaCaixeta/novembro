@@ -1,0 +1,169 @@
+# formatar_saida.py
+
+# Função para tratar results_valida e atualizar listaSubs com apenas os MANTIDOS
+
+import logging
+from typing import Dict, List
+
+logging.basicConfig(
+level=logging.INFO,
+format=’[%(asctime)s] [%(levelname)s] %(message)s’
+)
+logger = logging.getLogger(“formatar_saida”)
+
+def extrair_subsidios_mantidos(results_valida: Dict) -> Dict[str, Dict]:
+“””
+Extrai os subsídios MANTIDOS de results_valida agrupados por documento do envolvido
+
+```
+Args:
+    results_valida: resultado completo da validação
+    
+Returns:
+    Dict mapeando numero_documento -> subsidios mantidos
+"""
+
+# Se retornou erro ou status especial
+if not results_valida:
+    return {}
+
+if "erro" in results_valida:
+    return {}
+
+if results_valida.get("status") in ["texto vazio ou nulo", "nenhum envolvido", "TRATATIVA_MANUAL"]:
+    return {}
+
+resultado = {}
+
+for env in results_valida.get("resultado_por_envolvido", []):
+    doc = env.get("numero_documento_envolvido") or "NÃO ENCONTRADO"
+    nome = env.get("nome") or "NÃO ENCONTRADO"
+    chave = f"{nome}|{doc}"
+    
+    subsidios_mantidos = {}
+    subsidios_validados = env.get("subsidios_validados") or {}
+    
+    for id_subsidio, dados in subsidios_validados.items():
+        # Apenas MANTIDOS com flag_presenca_final = SIM
+        if dados.get("decisao_final") == "MANTIDO" and dados.get("flag_presenca_final") == "SIM":
+            
+            classif_previa = dados.get("classificacao_previa", {}) or {}
+            validacao_llm = dados.get("validacao_llm", {}) or {}
+            
+            # Prioriza texto_evidencia da LLM, senão usa trecho_identificado
+            trecho = validacao_llm.get("texto_evidencia") or classif_previa.get("trecho_identificado")
+            
+            # Prioriza justificativa da LLM, senão usa da classificação prévia
+            justificativa = validacao_llm.get("justificativa") or classif_previa.get("justificativa_agente")
+            
+            subsidios_mantidos[id_subsidio] = {
+                "flag_presenca": "SIM",
+                "trecho_identificado": trecho,
+                "justificativa_agente": justificativa,
+                "score_final": dados.get("score_final")
+            }
+    
+    resultado[chave] = {
+        "numero_documento_envolvido": doc,
+        "nome": nome,
+        "subsidios": subsidios_mantidos
+    }
+
+return resultado
+```
+
+def atualizar_lista_subs(lista_subs: List[Dict], results_valida: Dict) -> List[Dict]:
+“””
+Atualiza listaSubs com apenas os subsídios MANTIDOS de results_valida
+
+```
+Args:
+    lista_subs: listaSubs original
+    results_valida: resultado completo da validação
+    
+Returns:
+    listaSubs atualizado com apenas subsídios MANTIDOS
+"""
+
+# Extrai subsidios mantidos
+mantidos_por_envolvido = extrair_subsidios_mantidos(results_valida)
+
+if not mantidos_por_envolvido:
+    logger.warning("Nenhum subsídio mantido encontrado em results_valida")
+    # Retorna listaSubs com subsidios vazios
+    lista_atualizada = []
+    for item in lista_subs:
+        item_atualizado = item.copy()
+        item_atualizado["subsidios"] = {}
+        lista_atualizada.append(item_atualizado)
+    return lista_atualizada
+
+lista_atualizada = []
+
+for item in lista_subs:
+    doc = item.get("numero_documento_envolvido") or "NÃO ENCONTRADO"
+    nome = item.get("nome_envolvido") or "NÃO ENCONTRADO"
+    
+    # Tenta encontrar pelos dois formatos de chave
+    chave1 = f"{nome}|{doc}"
+    chave2 = f"{nome.upper()}|{doc}" if nome else f"SEM_NOME|{doc}"
+    
+    mantidos = None
+    for chave in [chave1, chave2]:
+        if chave in mantidos_por_envolvido:
+            mantidos = mantidos_por_envolvido[chave]
+            break
+    
+    # Se não encontrou pela chave, tenta só pelo documento
+    if mantidos is None:
+        for k, v in mantidos_por_envolvido.items():
+            if v.get("numero_documento_envolvido") == doc:
+                mantidos = v
+                break
+    
+    # Cria item atualizado
+    item_atualizado = {
+        "numero_documento_envolvido": doc,
+        "nome_envolvido": nome,
+        "analisar_isolado": item.get("analisar_isolado", "sim"),
+        "tipo_documento": item.get("tipo_documento", ""),
+        "id_cliente": item.get("id_cliente", ""),
+        "flag_relacionamento": item.get("flag_relacionamento", ""),
+        "produtos": item.get("produtos", ""),
+        "subsidios": mantidos.get("subsidios", {}) if mantidos else {}
+    }
+    
+    lista_atualizada.append(item_atualizado)
+    
+    # Log
+    qtd_mantidos = len(item_atualizado["subsidios"])
+    logger.info(f"Envolvido {doc}: {qtd_mantidos} subsídios mantidos")
+
+return lista_atualizada
+```
+
+def processar_dataframe(df, coluna_results_valida: str = “results_valida”, coluna_lista_subs: str = “listaSubs”):
+“””
+Processa DataFrame inteiro: pega results_valida e atualiza listaSubs
+
+```
+Args:
+    df: DataFrame com results_valida e listaSubs
+    coluna_results_valida: nome da coluna com results_valida
+    coluna_lista_subs: nome da coluna com listaSubs
+    
+Returns:
+    DataFrame com listaSubs atualizado
+"""
+
+def processar_linha(row):
+    results_valida = row.get(coluna_results_valida, {})
+    lista_subs = row.get(coluna_lista_subs, [])
+    return atualizar_lista_subs(lista_subs, results_valida)
+
+df[coluna_lista_subs] = df.apply(processar_linha, axis=1)
+
+logger.info(f"DataFrame processado: {len(df)} linhas atualizadas")
+
+return df
+```
